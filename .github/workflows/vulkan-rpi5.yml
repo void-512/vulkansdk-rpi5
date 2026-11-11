@@ -34,8 +34,8 @@ jobs:
       LD: ld.lld-23
       CMAKE_GENERATOR: Ninja
       CMAKE_BUILD_PARALLEL_LEVEL: '6'
-      CFLAGS: '-O3 -ffast-math -mcpu=cortex-a76+nossbs+noras -flto -ffunction-sections -fdata-sections'
-      CXXFLAGS: '-O3 -ffast-math -mcpu=cortex-a76+nossbs+noras -flto -stdlib=libc++ -ffunction-sections -fdata-sections'
+      CFLAGS: '-O3 -mcpu=cortex-a76+nossbs+noras -flto -ffunction-sections -fdata-sections'
+      CXXFLAGS: '-O3 -mcpu=cortex-a76+nossbs+noras -flto -stdlib=libc++ -ffunction-sections -fdata-sections'
       LDFLAGS: '-Wl,-O3 -Wl,--strip-all -Wl,--gc-sections -fuse-ld=lld -flto -rtlib=compiler-rt -unwindlib=libunwind'
 
     steps:
