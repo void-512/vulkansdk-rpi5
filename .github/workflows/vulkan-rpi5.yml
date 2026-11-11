@@ -1,0 +1,284 @@
+name: Vulkan SDK - Raspberry Pi 5 - Debian 13
+
+on:
+  workflow_dispatch:
+    inputs:
+      sdk_version:
+        description: 'LunarG SDK version; leave blank to use the newest Linux release'
+        required: false
+        type: string
+      full_sdk:
+        description: 'Also build heavyweight/GUI SDK components (may require upstream fixes)'
+        required: false
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-26.04-arm
+    timeout-minutes: 360
+    container:
+      image: debian:trixie
+    env:
+      DEBIAN_FRONTEND: noninteractive
+      CC: clang-23
+      CXX: clang++-23
+      AR: llvm-ar-23
+      NM: llvm-nm-23
+      RANLIB: llvm-ranlib-23
+      STRIP: llvm-strip-23
+      OBJCOPY: llvm-objcopy-23
+      LD: ld.lld-23
+      CMAKE_GENERATOR: Ninja
+      CMAKE_BUILD_PARALLEL_LEVEL: '6'
+      CFLAGS: '-O3 -ffast-math -mcpu=cortex-a76+nossbs+noras -flto -ffunction-sections -fdata-sections'
+      CXXFLAGS: '-O3 -ffast-math -mcpu=cortex-a76+nossbs+noras -flto -stdlib=libc++ -ffunction-sections -fdata-sections'
+      LDFLAGS: '-Wl,-O3 -Wl,--strip-all -Wl,--gc-sections -fuse-ld=lld -flto -rtlib=compiler-rt -unwindlib=libunwind'
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - name: Install build tools and Debian 13 dependencies
+        shell: bash
+        run: |
+          set -euxo pipefail
+          apt-get update
+          apt-get install -y --no-install-recommends \
+            ca-certificates curl gnupg jq git file xz-utils tar findutils \
+            cmake ninja-build make pkg-config patchelf binutils \
+            python3 python3-pip python3-setuptools python3-wheel python3-jsonschema python-is-python3 \
+            bison ocaml-core \
+            libglm-dev libpng-dev libpciaccess-dev \
+            libxcb-dri3-dev libxcb-present-dev libxcb-keysyms1-dev \
+            libxcb-randr0-dev libxcb-ewmh-dev \
+            libx11-dev libx11-xcb-dev libxrandr-dev \
+            libwayland-dev wayland-protocols liblz4-dev libzstd-dev libxml2-dev \
+            libssl-dev zlib1g-dev libdrm-dev \
+            libxkbcommon-dev libxext-dev libxfixes-dev \
+            qtbase5-dev qt6-base-dev qt6-wayland-dev
+
+          # LLVM 23 for Debian Trixie, from the upstream LLVM project.
+          curl -fsSL https://apt.llvm.org/llvm-snapshot.gpg.key \
+            | gpg --dearmor -o /usr/share/keyrings/apt-llvm.gpg
+          echo 'deb [signed-by=/usr/share/keyrings/apt-llvm.gpg] https://apt.llvm.org/trixie/ llvm-toolchain-trixie-23 main' \
+            > /etc/apt/sources.list.d/llvm23.list
+          apt-get update
+          apt-get install -y --no-install-recommends \
+            clang-23 clang-tools-23 lld-23 llvm-23 llvm-23-dev \
+            libclang-rt-23-dev libc++-23-dev libc++abi-23-dev \
+            libunwind-23-dev
+          clang-23 --version
+          clang++-23 --version
+          ld.lld-23 --version
+
+          # Fail early rather than silently downgrade the requested CPU target.
+          printf 'int f(void) { return 1; }\n' \
+            | clang-23 -x c -c -mcpu=cortex-a76+nossbs+noras - -o /tmp/cortex-a76.o
+
+      - name: Resolve newest published upstream Vulkan SDK and mimalloc 3
+        shell: bash
+        env:
+          REQUESTED_SDK: ${{ inputs.sdk_version }}
+        run: |
+          set -euo pipefail
+          sdk="${REQUESTED_SDK:-}"
+          if [[ -z "$sdk" ]]; then
+            sdk="$(curl -fsSL https://vulkan.lunarg.com/sdk/latest/linux.txt | tr -d '\r\n')"
+          fi
+          [[ "$sdk" =~ ^[0-9]+(\.[0-9]+)+$ ]]
+          mi="$(curl -fsSL https://api.github.com/repos/microsoft/mimalloc/releases/latest \
+            | jq -r '.tag_name')"
+          [[ "$mi" =~ ^v3\.[0-9]+\.[0-9]+$ ]]
+          echo "SDK_VERSION=$sdk" >> "$GITHUB_ENV"
+          echo "MIMALLOC_TAG=$mi" >> "$GITHUB_ENV"
+          echo "SDK version: $sdk; mimalloc release: $mi"
+
+      - name: Build mimalloc 3 static archive and override object using LLVM
+        shell: bash
+        run: |
+          set -euxo pipefail
+          git clone --depth 1 --branch "$MIMALLOC_TAG" \
+            https://github.com/microsoft/mimalloc.git /tmp/mimalloc-src
+          cmake -S /tmp/mimalloc-src -B /tmp/mimalloc-build -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_INSTALL_PREFIX=/opt/mimalloc \
+            -DCMAKE_INTERPROCEDURAL_OPTIMIZATION=ON \
+            -DMI_BUILD_SHARED=OFF \
+            -DMI_BUILD_STATIC=ON \
+            -DMI_BUILD_OBJECT=ON \
+            -DMI_BUILD_TESTS=OFF \
+            -DMI_OVERRIDE=ON \
+            -DMI_OPT_ARCH=OFF
+          cmake --build /tmp/mimalloc-build --parallel 6
+          cmake --install /tmp/mimalloc-build
+          mkdir -p /opt/mimalloc/lib
+          mi_object="$(find /tmp/mimalloc-build -type f -name mimalloc.o -print -quit)"
+          test -n "$mi_object"
+          cp "$mi_object" /opt/mimalloc/lib/mimalloc.o
+          test -f /opt/mimalloc/lib/mimalloc.o
+          find /opt/mimalloc -name '*.a' -print
+
+      - name: Create LLVM compiler frontends for static mimalloc in SDK executables
+        shell: bash
+        run: |
+          set -euxo pipefail
+          mkdir -p /opt/llvm-wrappers
+          cat > /opt/llvm-wrappers/clang <<'EOF'
+          #!/usr/bin/env bash
+          set -e
+          link_executable=true
+          for arg in "$@"; do
+            case "$arg" in
+              -c|-S|-E|-shared|-r|-fsyntax-only|-M|-MM|-###|--version|--help|-print-*|-dump*)
+                link_executable=false ;;
+            esac
+          done
+          if "$link_executable"; then
+            # Mimalloc's static override object is injected ONLY into executables.
+            exec /usr/bin/clang-23 /opt/mimalloc/lib/mimalloc.o "$@"
+          else
+            exec /usr/bin/clang-23 "$@"
+          fi
+          EOF
+          cat > /opt/llvm-wrappers/clang++ <<'EOF'
+          #!/usr/bin/env bash
+          set -e
+          link_executable=true
+          for arg in "$@"; do
+            case "$arg" in
+              -c|-S|-E|-shared|-r|-fsyntax-only|-M|-MM|-###|--version|--help|-print-*|-dump*)
+                link_executable=false ;;
+            esac
+          done
+          if "$link_executable"; then
+            # Static libc++/libc++abi/libunwind for command-line executables.
+            # Shared Vulkan layers retain dynamic linking where required.
+            exec /usr/bin/clang++-23 /opt/mimalloc/lib/mimalloc.o \
+              "$@" -nostdlib++ \
+              -Wl,-Bstatic -lc++ -lc++abi -lunwind -Wl,-Bdynamic
+          else
+            exec /usr/bin/clang++-23 "$@"
+          fi
+          EOF
+          chmod +x /opt/llvm-wrappers/clang /opt/llvm-wrappers/clang++
+
+          # Prefer static libraries in CMake projects unless the component
+          # explicitly requires a shared library (loader, layers, etc.).
+          cat > /opt/llvm-wrappers/rpi5-static.cmake <<'EOF'
+          set(BUILD_SHARED_LIBS OFF CACHE BOOL "Prefer static dependencies" FORCE)
+          set(CMAKE_POSITION_INDEPENDENT_CODE ON CACHE BOOL "PIC in static archives" FORCE)
+          EOF
+          echo 'CC=/opt/llvm-wrappers/clang' >> "$GITHUB_ENV"
+          echo 'CXX=/opt/llvm-wrappers/clang++' >> "$GITHUB_ENV"
+          echo 'CMAKE_TOOLCHAIN_FILE=/opt/llvm-wrappers/rpi5-static.cmake' >> "$GITHUB_ENV"
+
+      - name: Download and build the matching LunarG Vulkan SDK sources
+        shell: bash
+        env:
+          FULL_SDK: ${{ inputs.full_sdk }}
+        run: |
+          set -euxo pipefail
+          mkdir -p /opt/vulkan-sdk
+          cd /opt/vulkan-sdk
+          curl --retry 5 -fL \
+            "https://sdk.lunarg.com/sdk/download/${SDK_VERSION}/linux/vulkan-sdk.tar.xz" \
+            -o vulkan-sdk.tar.xz
+          tar -xJf vulkan-sdk.tar.xz
+          rm vulkan-sdk.tar.xz
+          cd "$SDK_VERSION"
+
+          # Uses the upstream release-matched component sources, not HEAD clones.
+          # Build the headless SDK by default; full_sdk also enables GUI/heavy tools.
+          if [[ "$FULL_SDK" == 'true' ]]; then
+            ./vulkansdk --skip-deps -j 6 all
+          else
+            ./vulkansdk --skip-deps -j 6 \
+              vulkan-loader vulkan-validationlayers vulkan-extensionlayer \
+              vulkan-tools shaderc glslang spirv-tools spirv-cross \
+              spirv-reflect vulkan-profiles volk vma vul
+          fi
+
+      - name: Package relocatable SDK as a conventional release archive
+        shell: bash
+        run: |
+          set -euxo pipefail
+          built="/opt/vulkan-sdk/${SDK_VERSION}/aarch64"
+          test -d "$built"
+
+          # Conventional versioned SDK prefix: no setup scripts or activation needed.
+          # Layout matches the usual release style: bin/, include/, lib/, share/.
+          release="vulkan-sdk-${SDK_VERSION}-aarch64-linux-debian13-llvm23-cortex-a76"
+          out="$GITHUB_WORKSPACE/$release"
+          mkdir -p "$out"/{bin,include,lib,share}
+          cp -a "$built/." "$out/"
+
+          # Keep LLVM runtime DSOs for components that must remain shared.
+          # libc (glibc) and Mesa/V3DV intentionally come from the host OS.
+          for soname in libc++.so.1 libc++abi.so.1 libunwind.so.1; do
+            runtime="$(ldconfig -p | awk -v name="$soname" '$1 == name {print $NF; exit}')"
+            if [[ -n "$runtime" && -f "$runtime" ]]; then
+              cp -L "$runtime" "$out/lib/$soname"
+            fi
+          done
+
+          # The upstream SDK may itself contain environment helper scripts.
+          # Do not distribute any: users configure their environment manually.
+          find "$out" -type f \( -name 'setup-env.sh' -o -name 'setup_env.sh' \) -delete
+
+          # Relative RUNPATH for executables, so no SDK-wide LD_LIBRARY_PATH is
+          # required for normal binaries. Preserve system Vulkan ICD discovery.
+          if [[ -d "$out/bin" ]]; then
+            while IFS= read -r -d '' f; do
+              if file "$f" | grep -Eq 'ELF.*(executable|pie executable)'; then
+                patchelf --set-rpath '$ORIGIN/../lib:$ORIGIN/../lib64:$ORIGIN/../lib/VulkanLoader/lib' "$f"
+              fi
+            done < <(find "$out/bin" -type f -print0)
+          fi
+
+          # Shared SDK objects need to locate co-packaged dependencies too.
+          if [[ -d "$out/lib" ]]; then
+            while IFS= read -r -d '' f; do
+              if file "$f" | grep -q 'ELF.*shared object'; then
+                patchelf --set-rpath '$ORIGIN:$ORIGIN/..:$ORIGIN/../VulkanLoader/lib' "$f"
+              fi
+            done < <(find "$out/lib" -type f -print0)
+          fi
+
+          printf 'Vulkan SDK: %s\nLLVM: 23\nCPU: Cortex-A76\nOS: Debian 13 aarch64\nmimalloc: %s\n' \
+            "$SDK_VERSION" "$MIMALLOC_TAG" > "$out/BUILD-INFO.txt"
+          archive="${release}.tar.xz"
+          XZ_OPT="-9e -T6" tar -C "$GITHUB_WORKSPACE" -cJf "$GITHUB_WORKSPACE/$archive" "$release"
+          test -s "$GITHUB_WORKSPACE/$archive"
+          tar -tJf "$GITHUB_WORKSPACE/$archive" | head -50 || true
+          echo "SDK_RELEASE_DIR=$release" >> "$GITHUB_ENV"
+          echo "SDK_ARCHIVE=$archive" >> "$GITHUB_ENV"
+          ls -lh "$GITHUB_WORKSPACE/$archive"
+
+      - name: Show ELF runtime dependencies
+        shell: bash
+        run: |
+          set -euo pipefail
+          out="$GITHUB_WORKSPACE/$SDK_RELEASE_DIR"
+          for tool in glslc glslangValidator spirv-opt vulkaninfo; do
+            if [[ -x "$out/bin/$tool" ]]; then
+              echo "=== $tool ==="
+              file "$out/bin/$tool"
+              ldd "$out/bin/$tool" || true
+            fi
+          done
+
+      - name: Upload SDK archive
+        uses: actions/upload-artifact@v7
+        with:
+          name: ${{ env.SDK_RELEASE_DIR }}
+          path: ${{ env.SDK_ARCHIVE }}
+          if-no-files-found: error
+          retention-days: 30
+          compression-level: 0
+
