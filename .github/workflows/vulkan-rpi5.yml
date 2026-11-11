@@ -52,7 +52,7 @@ jobs:
           apt-get install -y --no-install-recommends \
             ca-certificates curl gnupg jq git file xz-utils tar findutils \
             cmake ninja-build make pkg-config patchelf binutils \
-            python3 python3-pip python3-setuptools python3-wheel python3-venv python3-jsonschema python-is-python3 \
+            python3 python3-pip python3-setuptools python3-wheel python3-venv libpython3-all-dev python3-jsonschema python-is-python3 \
             bison ocaml-core \
             libglm-dev libpng-dev libpciaccess-dev \
             libxcb-dri3-dev libxcb-present-dev libxcb-keysyms1-dev \
